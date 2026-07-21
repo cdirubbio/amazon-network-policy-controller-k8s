@@ -355,9 +355,13 @@ func (r *defaultEndpointsResolver) getIngressRulesPorts(ctx context.Context, pol
 func (r *defaultEndpointsResolver) getPortList(pod corev1.Pod, ports []networking.NetworkPolicyPort) []policyinfo.Port {
 	var portList []policyinfo.Port
 	for _, port := range ports {
+		protocol := corev1.ProtocolTCP
+		if port.Protocol != nil {
+			protocol = *port.Protocol
+		}
 		var portPtr *int32
 		if port.Port != nil {
-			portVal, _, err := k8s.LookupContainerPortAndName(&pod, *port.Port, *port.Protocol)
+			portVal, _, err := k8s.LookupContainerPortAndName(&pod, *port.Port, protocol)
 			if err != nil {
 				// Isolate the pod for the port if we are unable to resolve the named port
 				r.logger.Info("Unable to lookup container port", "pod", k8s.NamespacedName(&pod),
@@ -367,7 +371,7 @@ func (r *defaultEndpointsResolver) getPortList(pod corev1.Pod, ports []networkin
 			portPtr = &portVal
 		}
 		portList = append(portList, policyinfo.Port{
-			Protocol: port.Protocol,
+			Protocol: &protocol,
 			Port:     portPtr,
 			EndPort:  port.EndPort,
 		})
@@ -519,12 +523,12 @@ func (r *defaultEndpointsResolver) getMatchingServiceClusterIPs(ctx context.Cont
 
 		var portList []policyinfo.Port
 		for _, npPort := range npPorts {
+			npProto := corev1.ProtocolTCP
+			if npPort.Protocol != nil {
+				npProto = *npPort.Protocol
+			}
 			var portPtr *int32
 			if npPort.Port != nil {
-				npProto := corev1.ProtocolTCP
-				if npPort.Protocol != nil {
-					npProto = *npPort.Protocol
-				}
 				portVal, err := r.getMatchingServicePort(svc, npPort.Port, npProto, getAllPods)
 				if err != nil {
 					r.logger.Info("Unable to lookup service port", "err", err)
@@ -544,7 +548,7 @@ func (r *defaultEndpointsResolver) getMatchingServiceClusterIPs(ctx context.Cont
 				portPtr = &portVal
 			}
 			portList = append(portList, policyinfo.Port{
-				Protocol: npPort.Protocol,
+				Protocol: &npProto,
 				Port:     portPtr,
 				EndPort:  npPort.EndPort,
 			})
