@@ -2433,6 +2433,42 @@ func TestGetMatchingServiceClusterIPs_NilProtocolDefaultsTCP(t *testing.T) {
 	require.Len(t, result[0].Ports, 1)
 	require.NotNil(t, result[0].Ports[0].Protocol, "Protocol must not be nil when NP port omits protocol")
 	assert.Equal(t, corev1.ProtocolTCP, *result[0].Ports[0].Protocol)
+
+	t.Run("protocol-only entry (nil Port, nil Protocol) emits non-nil TCP", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		mockClient := mock_client.NewMockClient(ctrl)
+		resolver := NewEndpointsResolver(mockClient, logr.New(&log.NullLogSink{}))
+
+		protocolOnlyPorts := []networking.NetworkPolicyPort{
+			{},
+		}
+
+		svc := corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc2", Namespace: "ns"},
+			Spec: corev1.ServiceSpec{
+				ClusterIP: "10.0.0.2",
+				Selector:  map[string]string{"app": "web"},
+				Ports: []corev1.ServicePort{
+					{Port: 80, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt(80)},
+				},
+			},
+		}
+
+		mockClient.EXPECT().List(gomock.Any(), gomock.AssignableToTypeOf(&corev1.ServiceList{}), gomock.Any()).
+			DoAndReturn(func(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+				list.(*corev1.ServiceList).Items = []corev1.Service{svc}
+				return nil
+			})
+
+		result := resolver.getMatchingServiceClusterIPs(context.Background(), ls, "ns", protocolOnlyPorts)
+		require.Len(t, result, 1)
+		require.Len(t, result[0].Ports, 1)
+		require.NotNil(t, result[0].Ports[0].Protocol, "protocol-only entry must emit non-nil Protocol")
+		assert.Equal(t, corev1.ProtocolTCP, *result[0].Ports[0].Protocol)
+		assert.Nil(t, result[0].Ports[0].Port, "protocol-only entry must have nil Port")
+	})
 }
 
 func TestEndpointsResolver_getPortList(t *testing.T) {
