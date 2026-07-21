@@ -2395,3 +2395,269 @@ func TestGetMatchingServiceClusterIPs_LazyPodFetch(t *testing.T) {
 func int32Ptr(i int32) *int32 {
 	return &i
 }
+
+func TestGetMatchingServiceClusterIPs_NilProtocolDefaultsTCP(t *testing.T) {
+	port80 := intstr.FromInt(80)
+
+	npPorts := []networking.NetworkPolicyPort{
+		{Port: &port80},
+	}
+	ls := &metav1.LabelSelector{}
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockClient := mock_client.NewMockClient(ctrl)
+	resolver := NewEndpointsResolver(mockClient, logr.New(&log.NullLogSink{}))
+
+	svc := corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc1", Namespace: "ns"},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "10.0.0.1",
+			Selector:  map[string]string{"app": "web"},
+			Ports: []corev1.ServicePort{
+				{Port: 80, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt(80)},
+			},
+		},
+	}
+
+	mockClient.EXPECT().List(gomock.Any(), gomock.AssignableToTypeOf(&corev1.ServiceList{}), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+			list.(*corev1.ServiceList).Items = []corev1.Service{svc}
+			return nil
+		})
+
+	result := resolver.getMatchingServiceClusterIPs(context.Background(), ls, "ns", npPorts)
+	require.Len(t, result, 1)
+	assert.Equal(t, policyinfo.NetworkAddress("10.0.0.1"), result[0].CIDR)
+	require.Len(t, result[0].Ports, 1)
+	require.NotNil(t, result[0].Ports[0].Protocol, "Protocol must not be nil when NP port omits protocol")
+	assert.Equal(t, corev1.ProtocolTCP, *result[0].Ports[0].Protocol)
+}
+
+func TestEndpointsResolver_getPortList(t *testing.T) {
+	protocolTCP := corev1.ProtocolTCP
+	protocolUDP := corev1.ProtocolUDP
+
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Ports: []corev1.ContainerPort{
+						{Name: "http", ContainerPort: 80, Protocol: corev1.ProtocolTCP},
+						{Name: "metrics", ContainerPort: 9090, Protocol: corev1.ProtocolTCP},
+						{Name: "dns", ContainerPort: 53, Protocol: corev1.ProtocolUDP},
+					},
+				},
+			},
+		},
+	}
+
+	namedPortHTTP := intstr.FromString("http")
+	namedPortMetrics := intstr.FromString("metrics")
+	namedPortDNS := intstr.FromString("dns")
+	numericPort80 := intstr.FromInt(80)
+	numericPort443 := intstr.FromInt(443)
+
+	var port80 int32 = 80
+	var port443 int32 = 443
+	var port9090 int32 = 9090
+	var port53 int32 = 53
+
+	tests := []struct {
+		name     string
+		ports    []networking.NetworkPolicyPort
+		wantLen  int
+		wantPort []policyinfo.Port
+	}{
+		{
+			name: "nil Protocol + named port defaults to TCP",
+			ports: []networking.NetworkPolicyPort{
+				{Port: &namedPortHTTP},
+			},
+			wantLen: 1,
+			wantPort: []policyinfo.Port{
+				{Protocol: &protocolTCP, Port: &port80},
+			},
+		},
+		{
+			name: "nil Protocol + numeric port defaults to TCP",
+			ports: []networking.NetworkPolicyPort{
+				{Port: &numericPort80},
+			},
+			wantLen: 1,
+			wantPort: []policyinfo.Port{
+				{Protocol: &protocolTCP, Port: &port80},
+			},
+		},
+		{
+			name: "nil Protocol + nil Port (protocol-only entry) defaults to TCP",
+			ports: []networking.NetworkPolicyPort{
+				{},
+			},
+			wantLen: 1,
+			wantPort: []policyinfo.Port{
+				{Protocol: &protocolTCP},
+			},
+		},
+		{
+			name: "explicit TCP Protocol + named port",
+			ports: []networking.NetworkPolicyPort{
+				{Protocol: &protocolTCP, Port: &namedPortMetrics},
+			},
+			wantLen: 1,
+			wantPort: []policyinfo.Port{
+				{Protocol: &protocolTCP, Port: &port9090},
+			},
+		},
+		{
+			name: "explicit UDP Protocol + named port",
+			ports: []networking.NetworkPolicyPort{
+				{Protocol: &protocolUDP, Port: &namedPortDNS},
+			},
+			wantLen: 1,
+			wantPort: []policyinfo.Port{
+				{Protocol: &protocolUDP, Port: &port53},
+			},
+		},
+		{
+			name: "explicit TCP Protocol + numeric port",
+			ports: []networking.NetworkPolicyPort{
+				{Protocol: &protocolTCP, Port: &numericPort443},
+			},
+			wantLen: 1,
+			wantPort: []policyinfo.Port{
+				{Protocol: &protocolTCP, Port: &port443},
+			},
+		},
+		{
+			name: "mixed: named+TCP followed by numeric nil-protocol (RCA Repro 3)",
+			ports: []networking.NetworkPolicyPort{
+				{Protocol: &protocolTCP, Port: &namedPortHTTP},
+				{Port: &numericPort443},
+			},
+			wantLen: 2,
+			wantPort: []policyinfo.Port{
+				{Protocol: &protocolTCP, Port: &port80},
+				{Protocol: &protocolTCP, Port: &port443},
+			},
+		},
+		{
+			name: "multiple nil-Protocol entries: named and numeric",
+			ports: []networking.NetworkPolicyPort{
+				{Port: &namedPortHTTP},
+				{Port: &numericPort443},
+				{Port: &namedPortMetrics},
+			},
+			wantLen: 3,
+			wantPort: []policyinfo.Port{
+				{Protocol: &protocolTCP, Port: &port80},
+				{Protocol: &protocolTCP, Port: &port443},
+				{Protocol: &protocolTCP, Port: &port9090},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := &defaultEndpointsResolver{
+				logger: logr.Discard(),
+			}
+			result := resolver.getPortList(pod, tt.ports)
+			require.Len(t, result, tt.wantLen)
+			for i, want := range tt.wantPort {
+				require.NotNil(t, result[i].Protocol, "Protocol must not be nil at index %d", i)
+				assert.Equal(t, *want.Protocol, *result[i].Protocol, "Protocol mismatch at index %d", i)
+				if want.Port != nil {
+					require.NotNil(t, result[i].Port, "Port must not be nil at index %d", i)
+					assert.Equal(t, *want.Port, *result[i].Port, "Port value mismatch at index %d", i)
+				} else {
+					assert.Nil(t, result[i].Port, "Port should be nil at index %d", i)
+				}
+			}
+		})
+	}
+}
+
+func TestEndpointsResolver_convertToPolicyInfoPortForCIDRs(t *testing.T) {
+	protocolTCP := corev1.ProtocolTCP
+	protocolUDP := corev1.ProtocolUDP
+
+	numericPort80 := intstr.FromInt(80)
+	numericPort443 := intstr.FromInt(443)
+	namedPortHTTP := intstr.FromString("http")
+	var port80 int32 = 80
+	var port443 int32 = 443
+	var endPort8080 int32 = 8080
+
+	tests := []struct {
+		name string
+		port networking.NetworkPolicyPort
+		want *policyinfo.Port
+	}{
+		{
+			name: "nil Protocol + numeric port defaults to TCP",
+			port: networking.NetworkPolicyPort{Port: &numericPort80},
+			want: &policyinfo.Port{Protocol: &protocolTCP, Port: &port80},
+		},
+		{
+			name: "nil Protocol + nil Port (protocol-only) defaults to TCP",
+			port: networking.NetworkPolicyPort{},
+			want: &policyinfo.Port{Protocol: &protocolTCP},
+		},
+		{
+			name: "nil Protocol + named port returns nil (cannot resolve without pod)",
+			port: networking.NetworkPolicyPort{Port: &namedPortHTTP},
+			want: nil,
+		},
+		{
+			name: "explicit TCP Protocol + numeric port",
+			port: networking.NetworkPolicyPort{Protocol: &protocolTCP, Port: &numericPort443},
+			want: &policyinfo.Port{Protocol: &protocolTCP, Port: &port443},
+		},
+		{
+			name: "explicit UDP Protocol + numeric port",
+			port: networking.NetworkPolicyPort{Protocol: &protocolUDP, Port: &numericPort80},
+			want: &policyinfo.Port{Protocol: &protocolUDP, Port: &port80},
+		},
+		{
+			name: "EndPort passthrough",
+			port: networking.NetworkPolicyPort{Protocol: &protocolTCP, Port: &numericPort80, EndPort: &endPort8080},
+			want: &policyinfo.Port{Protocol: &protocolTCP, Port: &port80, EndPort: &endPort8080},
+		},
+		{
+			name: "nil Protocol + numeric port + EndPort",
+			port: networking.NetworkPolicyPort{Port: &numericPort80, EndPort: &endPort8080},
+			want: &policyinfo.Port{Protocol: &protocolTCP, Port: &port80, EndPort: &endPort8080},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := &defaultEndpointsResolver{
+				logger: logr.Discard(),
+			}
+			result := resolver.convertToPolicyInfoPortForCIDRs(tt.port)
+			if tt.want == nil {
+				assert.Nil(t, result)
+				return
+			}
+			require.NotNil(t, result)
+			require.NotNil(t, result.Protocol, "Protocol must not be nil")
+			assert.Equal(t, *tt.want.Protocol, *result.Protocol)
+			if tt.want.Port != nil {
+				require.NotNil(t, result.Port)
+				assert.Equal(t, *tt.want.Port, *result.Port)
+			} else {
+				assert.Nil(t, result.Port)
+			}
+			if tt.want.EndPort != nil {
+				require.NotNil(t, result.EndPort)
+				assert.Equal(t, *tt.want.EndPort, *result.EndPort)
+			} else {
+				assert.Nil(t, result.EndPort)
+			}
+		})
+	}
+}
